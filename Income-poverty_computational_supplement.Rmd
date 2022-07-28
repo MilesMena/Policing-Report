@@ -1,0 +1,543 @@
+---
+title: "Income&poverty_computational_supplement"
+author: "Marchelle"
+date: '2022-07-26'
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+# load the packages
+library(lubridate)
+library(ggplot2)
+library(dplyr)
+library(tidyverse)
+library(stringr)
+library(tigris)
+library(tidycensus)
+library(readxl)
+library(here)
+library(rlang)
+library(sf)
+```
+
+```{r}
+# load the data, get rid of missing values for charge description and for coordinates
+LAPDArrest_all <- read.csv("Arrest_Data_from_2010_to_2019.csv", na.strings=c("","NA")) %>% 
+  drop_na(Charge.Group.Description) %>% 
+  drop_na(Arrest.Date)
+LAPDArrest_all<-subset(LAPDArrest_all, LON!=0.0000) 
+
+NYPDArrest_all <- read.csv("NYPD_Arrests_Data__Historic_all.csv", na.strings=c("","NA")) %>% 
+  drop_na(OFNS_DESC) %>% 
+  drop_na(Longitude)
+```
+
+
+```{r}
+# this takes the lat and lon data for the arrests in LAPD and converts it to the system we want it to be in 
+LAPD_sf <- LAPDArrest_all %>%
+  st_as_sf(coords = c("LON", "LAT"),
+           crs = 4326) %>%
+  st_transform(4267)
+#turn the date into a time date object
+LAPD_sf<-LAPD_sf %>% 
+  mutate(Arrest.Date=mdy(Arrest.Date))
+
+#convert NYPD data to correct system
+NYPD_sf <- NYPDArrest_all %>%
+  st_as_sf(coords = c("Longitude", "Latitude"),
+           crs = 4326) %>%
+  st_transform(6539)
+
+#only want Arrests from 2010 to 2019
+NYPD_sf<-NYPD_sf %>% 
+  mutate(ARREST_DATE=mdy(ARREST_DATE)) %>% 
+  filter(year(ARREST_DATE)>=2010) %>% 
+  filter(year(ARREST_DATE)<=2019)
+
+#make a list of the unique years
+years<-unique(year(LAPD_sf$Arrest.Date))
+years_ny<-unique(year(NYPD_sf$ARREST_DATE))
+
+
+```
+
+## LAPD Income Residual calculations
+```{r}
+ 
+# make empty data frame for residuals for each year
+output <- data.frame(Charge.Group.Description=character(),
+                     `1`=numeric(),
+                     `2`=numeric(),
+                     `3`=numeric(),
+                     `4`=numeric(),
+                     year=numeric(),
+                     stringsAsFactors = FALSE)
+
+
+
+for (i in years)
+  {
+  empty_list <- list() #make an empty list for residuals to be stored in
+  for(k in 1:15) #do this 15 times 
+    {
+    #load census data for each year
+LA_incomepop <- get_acs(
+  geography = "tract", 
+  variables = c(income="B19013_001", population="B01003_001"),
+  output = "wide",
+  state = "CA", 
+  county = "Los Angeles County",
+  year = i,
+  geometry = TRUE
+) %>%
+  st_transform(4267)
+
+# filter by year
+LAPDbyY<-LAPD_sf %>% 
+  filter(year(Arrest.Date)==i)
+# join the arrest data and the spatial data from the census
+INCOMEpop_joined <- st_join(
+  LAPDbyY,
+  LA_incomepop
+)
+INCOMEpop_joined$Ones<-1 #so we can tally up arrests later
+INCOMEpop_joined<-INCOMEpop_joined %>% drop_na(incomeE)
+INCOMEpop_joined <- as(INCOMEpop_joined, 'Spatial')
+INCOMEpop_joined<-as.data.frame(INCOMEpop_joined)
+
+# make quartiles for income 
+INCOMEbreaks <- INCOMEpop_joined %>% 
+  mutate(INCOMEpop_joined, quantile_rank = ntile(INCOMEpop_joined$incomeE,4)) 
+
+
+# number of arrests for each charge group description
+INCOMEbreaks <- INCOMEbreaks %>%
+  group_by(Charge.Group.Description) %>% 
+  mutate(Sum=sum(Ones)) %>% 
+  ungroup
+
+#only want these two variables for chi squared
+filteredIncome<-INCOMEbreaks[c("Charge.Group.Description","quantile_rank")]
+
+
+filteredIncome<-table(filteredIncome)
+filteredIncome<-as.matrix(filteredIncome)
+filteredIncome<-as.data.frame.matrix(filteredIncome)
+filteredIncome<-filteredIncome %>% filter_all(all_vars(. >= 100)) #filter so we have enough for chi sq test
+
+filteredIncome<-as.matrix(filteredIncome)
+filteredIncome<-as.table(filteredIncome)
+filteredIncome<-as.data.frame(filteredIncome)
+
+
+
+# Convert from data frame of counts to data frame of cases.
+# `countcol` is the name of the column containing the counts
+countsToCases <- function(filteredIncome, countcol = "Freq") {
+    # Get the row indices to pull from filteredIncome
+    idx <- rep.int(seq_len(nrow(filteredIncome)), filteredIncome[[countcol]])
+
+    # Drop count column
+    filteredIncome[[countcol]] <- NULL
+
+    # Get the rows from filteredIncome
+    filteredIncome[idx, ]
+}
+
+filteredIncome<-countsToCases(filteredIncome)
+
+
+
+#take 10000 random samples from the data
+rand_df <- filteredIncome[sample(nrow(filteredIncome),10000,replace=TRUE),]
+#make a contingency table
+conTable = table(rand_df)
+result<-chisq.test(conTable) #chi squared test
+
+# if the statistic is greater than critical
+    if (result$`statistic` >72.1532){
+  print('Dependent (reject H0)')
+      print(i) #know for what year
+}else{
+  print('Independent (fail to reject H0)')
+print(i)
+}
+
+chi<-as.matrix(result$stdres) #matrix form
+
+
+#output<-rbind(output,chi)
+empty_list[[k]]<-chi #store in the empty list made earlier
+  }
+  
+summ<-Reduce('+', empty_list) #add all 15 matrices
+summ<-(summ/15) #divide by 15 to get the mean
+
+summ<-cbind(summ,i)  #add year so we know for what year these results are from
+output<-rbind(output,summ) #store in empty data frame
+}
+  
+
+# arrange list chronilogically
+output<-output %>% 
+  arrange(i)
+```
+
+## LAPD Poverty Residual calculations
+```{r}
+
+#empty df
+output2 <- data.frame(Charge.Group.Description=character(),
+                     `1pov`=numeric(),
+                     `2pov`=numeric(),
+                     `3pov`=numeric(),
+                     `4pov`=numeric(),
+                     year=numeric(),
+                     stringsAsFactors = FALSE)
+for (i in years)
+  {
+  empty_list2 <- list()
+  for(k in 1:15)
+    {
+    #census data
+LA_pov <- get_acs(geography = "tract",
+                  variables = c(poverty="B17001_002",population="B01003_001"),
+                  output = "wide",
+                  summary_var = "B17001_001",
+                  geometry = TRUE, 
+                  state = "CA", 
+                  county = "Los Angeles County",
+                  year = i) %>%
+  mutate(pov_pct = 100*(povertyE/summary_est))%>% #poverty calculation
+  st_transform(4267)
+
+#filter by year
+LAPDbyY<-LAPD_sf %>% 
+  filter(year(Arrest.Date)==i)
+# join df
+pov_joined <- st_join(
+  LAPDbyY,
+  LA_pov
+)
+pov_joined$Ones<-1 #so we can tally up arrests later
+pov_joined<-pov_joined %>% drop_na(pov_pct)
+pov_joined <- as(pov_joined, 'Spatial')
+pov_joined<-as.data.frame(pov_joined)
+# make poverty quartiles
+pov_breaks <- pov_joined %>% 
+  mutate(pov_joined, quantile_rank = ntile(pov_joined$pov_pct,4)) 
+
+
+#number of arrests for each CGD
+pov_breaks <- pov_breaks %>%
+  group_by(Charge.Group.Description) %>% 
+  mutate(Sum=sum(Ones)) %>% 
+  ungroup
+
+
+#only these variables
+filteredpov<-pov_breaks[c("Charge.Group.Description","quantile_rank")]
+
+
+filteredpov<-table(filteredpov)
+filteredpov<-as.matrix(filteredpov)
+filteredpov<-as.data.frame.matrix(filteredpov)
+filteredpov<-filteredpov %>% filter_all(all_vars(. >= 100)) #filter so we have enough for chi sq test
+
+filteredpov<-as.matrix(filteredpov)
+filteredpov<-as.table(filteredpov)
+filteredpov<-as.data.frame(filteredpov)
+
+
+
+# Convert from data frame of counts to data frame of cases.
+# `countcol` is the name of the column containing the counts
+countsToCases <- function(filteredpov, countcol = "Freq") {
+    # Get the row indices to pull from filteredpov
+    idx <- rep.int(seq_len(nrow(filteredpov)), filteredpov[[countcol]])
+
+    # Drop count column
+    filteredpov[[countcol]] <- NULL
+
+    # Get the rows from filteredpov
+    filteredpov[idx, ]
+}
+
+filteredpov<-countsToCases(filteredpov)
+
+
+
+#random 10000
+rand_df2 <- filteredpov[sample(nrow(filteredpov),10000,replace=TRUE),]
+conTable2 = table(rand_df2)
+
+result2<-chisq.test(conTable2) #chi squared test
+
+# if statistic greater than critical value
+    if (result2$`statistic`>68.6693){
+  print('Dependent (reject H0)')
+      print(i)
+}else{
+  print('Independent (fail to reject H0)')
+print(i)
+}
+
+chi2<-as.matrix(result2$stdres)
+
+
+
+empty_list2[[k]]<-chi2
+
+
+  }
+  
+summ2<-Reduce('+', empty_list2) 
+summ2<-(summ2/15) #mean
+
+summ2<-cbind(summ2,i)  
+output2<-rbind(output2,summ2)
+}
+output2<-output2 %>% #arrange chronilogically
+  arrange(i)
+
+
+```
+
+## NYPD Income Residual Calculations
+```{r}
+
+
+output_ny <- data.frame(OFNS_DESC=character(),
+                     `1`=numeric(),
+                     `2`=numeric(),
+                     `3`=numeric(),
+                     `4`=numeric(),
+                     year=numeric(),
+                     stringsAsFactors = FALSE)
+
+for (i in years_ny)
+  {
+  empty_listNY <- list()
+  for(k in 1:15)
+    {
+    #census data for NY
+NY_incomepop <- get_acs(
+  geography = "tract", 
+  variables = c(income="B19013_001", population="B01003_001"),
+  output = "wide",
+  state = "NY", 
+  county = "New York County",
+  year = i,
+  geometry = TRUE
+) %>%
+  st_transform(6539)
+
+# filter by year
+NYPDbyY<-NYPD_sf %>% 
+  filter(year(ARREST_DATE)==i)
+
+NYIncome_joined <- st_join(
+  NYPDbyY,
+  NY_incomepop
+)
+NYIncome_joined$Ones<-1 #so we can tally up arrests later
+NYIncome_joined<-NYIncome_joined %>% drop_na(incomeE)
+NYIncome_joined <- as(NYIncome_joined, 'Spatial')
+NYIncome_joined<-as.data.frame(NYIncome_joined)
+# quartiles for income
+INCOMEbreaks <- NYIncome_joined %>% 
+  mutate(NYIncome_joined, quantile_rank = ntile(NYIncome_joined$incomeE,4)) 
+
+
+# number of arrests per CGD
+INCOMEbreaks <- INCOMEbreaks %>%
+  group_by(OFNS_DESC) %>% 
+  mutate(Sum=sum(Ones)) %>% 
+  ungroup
+
+# only want these ones
+filteredIncome<-INCOMEbreaks[c("OFNS_DESC","quantile_rank")]
+
+
+filteredIncome<-table(filteredIncome)
+filteredIncome<-as.matrix(filteredIncome)
+filteredIncome<-as.data.frame.matrix(filteredIncome)
+filteredIncome<-filteredIncome %>% filter_all(all_vars(. >= 100)) #filter so we have enough for chi sq test
+
+filteredIncome<-as.matrix(filteredIncome)
+filteredIncome<-as.table(filteredIncome)
+filteredIncome<-as.data.frame(filteredIncome)
+
+
+
+# Convert from data frame of counts to data frame of cases.
+# `countcol` is the name of the column containing the counts
+countsToCases <- function(filteredIncome, countcol = "Freq") {
+    # Get the row indices to pull from filteredIncome
+    idx <- rep.int(seq_len(nrow(filteredIncome)), filteredIncome[[countcol]])
+
+    # Drop count column
+    filteredIncome[[countcol]] <- NULL
+
+    # Get the rows from filteredIncome
+    filteredIncome[idx, ]
+}
+
+filteredIncome<-countsToCases(filteredIncome)
+
+
+
+rand_df_ny <- filteredIncome[sample(nrow(filteredIncome),10000,replace=TRUE),]
+conTable_ny = table(rand_df_ny)
+
+result_ny<-chisq.test(conTable_ny)
+
+# if statistic is greater than critical value
+    if (result_ny$`statistic` >79.0819){
+  print('Dependent (reject H0)')
+      print(i)
+}else{
+  print('Independent (fail to reject H0)')
+print(i)
+}
+
+chi_ny<-as.matrix(result_ny$stdres)
+
+
+
+empty_listNY[[k]]<-chi_ny
+  }
+  
+summ_ny<-Reduce('+', empty_listNY) 
+summ_ny<-(summ_ny/15) #mean
+
+summ_ny<-cbind(summ_ny,i)  
+output_ny<-rbind(output_ny,summ_ny)
+}
+  
+
+#arrange
+output_ny<-output_ny %>% 
+  arrange(i)
+```
+
+## NYPD Poverty Residual Calculations
+```{r}
+
+
+output_ny2 <- data.frame(OFNS_DESC=character(),
+                     `1`=numeric(),
+                     `2`=numeric(),
+                     `3`=numeric(),
+                     `4`=numeric(),
+                     year=numeric(),
+                     stringsAsFactors = FALSE)
+
+for (i in years_ny)
+  {
+  empty_listNY2 <- list()
+  for(k in 1:15)
+    {
+NY_pov <- get_acs(geography = "tract",
+                  variables = c(poverty="B17001_002",population="B01003_001"),
+                  output = "wide",
+                  summary_var = "B17001_001",
+                  geometry = TRUE, 
+                  state = "NY", 
+                  county = "New York County",
+                  year = i) %>%
+  mutate(pov_pct = 100*(povertyE/summary_est))%>% #poverty calculation
+  st_transform(6539)
+
+
+NYPDbyY<-NYPD_sf %>% 
+  filter(year(ARREST_DATE)==i)
+
+NYpov_joined <- st_join(
+  NYPDbyY,
+  NY_pov
+)
+NYpov_joined$Ones<-1 #so we can tally up arrests later
+NYpov_joined<-NYpov_joined %>% drop_na(pov_pct)
+NYpov_joined <- as(NYpov_joined, 'Spatial')
+NYpov_joined<-as.data.frame(NYpov_joined)
+# quartiles for poverty rate
+INCOMEbreaks <- NYpov_joined %>% 
+  mutate(NYpov_joined, quantile_rank = ntile(NYpov_joined$pov_pct,4)) 
+
+
+
+INCOMEbreaks <- INCOMEbreaks %>%
+  group_by(OFNS_DESC) %>% 
+  mutate(Sum=sum(Ones)) %>% 
+  ungroup
+
+
+
+filteredpov<-INCOMEbreaks[c("OFNS_DESC","quantile_rank")]
+
+
+filteredpov<-table(filteredpov)
+filteredpov<-as.matrix(filteredpov)
+filteredpov<-as.data.frame.matrix(filteredpov)
+filteredpov<-filteredpov %>% filter_all(all_vars(. >= 100)) #filter so we have enough for chi sq test
+
+filteredpov<-as.matrix(filteredpov)
+filteredpov<-as.table(filteredpov)
+filteredpov<-as.data.frame(filteredpov)
+
+
+
+# Convert from data frame of counts to data frame of cases.
+# `countcol` is the name of the column containing the counts
+countsToCases <- function(filteredpov, countcol = "Freq") {
+    # Get the row indices to pull from filteredpov
+    idx <- rep.int(seq_len(nrow(filteredpov)), filteredpov[[countcol]])
+
+    # Drop count column
+    filteredpov[[countcol]] <- NULL
+
+    # Get the rows from filteredpov
+    filteredpov[idx, ]
+}
+
+filteredpov<-countsToCases(filteredpov)
+
+
+
+
+rand_df_ny2 <- filteredpov[sample(nrow(filteredpov),10000,replace=TRUE),]
+conTable_ny2 = table(rand_df_ny2)
+
+result_ny2<-chisq.test(conTable_ny2)
+
+# if stat greater than crit value
+    if (result_ny2$`statistic` >79.0819){
+  print('Dependent (reject H0)')
+      print(i)
+}else{
+  print('Independent (fail to reject H0)')
+print(i)
+}
+
+chi_ny2<-as.matrix(result_ny2$stdres)
+
+
+
+
+empty_listNY2[[k]]<-chi_ny2
+  }
+  
+summ_ny2<-Reduce('+', empty_listNY2) 
+summ_ny2<-(summ_ny2/15) #mean
+
+summ_ny2<-cbind(summ_ny2,i)  
+output_ny2<-rbind(output_ny2,summ_ny2)
+}
+#arrange
+output_ny2<-output_ny2 %>% 
+  arrange(i)
+```
+

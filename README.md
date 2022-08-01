@@ -1,7 +1,7 @@
 # Policing-Report
 This report includes results and documentation after studying open police data. 
 
-We suggest starting with the write up contained in the .tex file,
+We suggest starting with the write up contained in the file named main.tex,
  then proceeding to the .ipynb for additional graphs and information,
  and finally seeing where the income and poverty data come from in the R markdown. 
 
